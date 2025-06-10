@@ -17,3 +17,6 @@ pyjwt
 boto3
 ipinfo
 fake-useragent
+impacket
+tqdm
+pysocks
