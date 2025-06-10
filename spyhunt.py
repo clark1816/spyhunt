@@ -18,6 +18,7 @@ from modules.jwt_analyzer import JWTAnalyzer
 from modules.ss3sec import S3Scanner
 from datetime import datetime
 from modules.heap_dump import HeapdumpAnalyzer
+from impacket.smbconnection import SMBConnection, SessionError
 from fake_useragent import UserAgent
 import waybackpy
 import threading
@@ -63,6 +64,7 @@ from threading import Lock
 from tqdm import tqdm
 from itertools import cycle
 import ftplib # Add this import
+import socks  # PySocks
 
 
 warnings.filterwarnings(action='ignore',module='bs4')
@@ -81,7 +83,7 @@ banner = f"""
 ░ ░▒  ░ ░░▒ ░     ▓██ ░▒░  ▒ ░▒░ ░░░▒░ ░ ░ ░ ░░   ░ ▒░    ░    
 ░  ░  ░  ░░       ▒ ▒ ░░   ░  ░░ ░ ░░░ ░ ░    ░   ░ ░   ░      
       ░           ░ ░      ░  ░  ░   ░              ░         
-{Fore.WHITE}V 3.3
+{Fore.WHITE}V 3.4
 {Fore.WHITE}By c0deninja
 {Fore.RESET}
 """
@@ -337,7 +339,6 @@ fuzzing_group.add_argument('-f_p', '--forbidden_pages',
                      type=str, help='forbidden pages',
                      metavar='domain.com')
 
-
 nuclei_group.add_argument('-nl', '--nuclei_lfi', action='store_true', help="Find Local File Inclusion with nuclei")
 nuclei_group.add_argument("-nc", "--nuclei", type=str, help="scan nuclei on a target", metavar="domain.com")
 nuclei_group.add_argument("-nct", "--nuclei_template", type=str, help="use a nuclei template", metavar="template.yaml")
@@ -410,6 +411,22 @@ ftp_group.add_argument('--ftp-userlist',
 ftp_group.add_argument('--ftp-passlist',
                     type=str, help='Path to a custom password list for FTP bruteforcing',
                     metavar='passwords.txt')
+ftp_group.add_argument('--ftp-proxylist',
+                    type=str, help='Path to a proxy list for FTP bruteforcing (format: socks5://host:port, socks4://host:port, http://host:port, or just IP:PORT for SOCKS5; only working proxies will be used automatically)',
+                    metavar='proxies.txt')
+
+# Add SMB Automated Pentest Arguments
+auto_smb_group = parser.add_argument_group('SMB Automated Pentest')
+auto_smb_group.add_argument('--smb_scan', action='store_true', help='Run SMB scan')
+auto_smb_group.add_argument('--smb_auto', action='store_true', help='Run automated SMB pentest')
+auto_smb_group.add_argument('--spray-userlist', type=str, help='User list for password spraying')
+auto_smb_group.add_argument('--spray-passlist', type=str, help='Password list for password spraying')
+auto_smb_group.add_argument('--spray-password', type=str, help='Single password to test against userlist')
+auto_smb_group.add_argument('--smb-target', type=str, help='Target IP or hostname for SMB automation')
+auto_smb_group.add_argument('--smb-user', type=str, help='Username for credential testing')
+auto_smb_group.add_argument('--smb-pass', type=str, help='Password for credential testing')
+auto_smb_group.add_argument('--smb-domain', type=str, help='Domain for credential testing', default='')
+
 
 args = parser.parse_args()
 
@@ -4544,8 +4561,43 @@ def check_banner_vulnerabilities(banner):
         print(f"{Fore.YELLOW}    Suggestion: Could not reliably parse software/version. Manually check the full banner against vulnerability databases.{Style.RESET_ALL}")
 
 
-def scan_ftp(target_host, target_port=DEFAULT_FTP_PORT, user_list_path=None, pass_list_path=None):
+def scan_ftp(target_host, target_port=DEFAULT_FTP_PORT, user_list_path=None, pass_list_path=None, proxy_list_path=None):
     print(f"{Fore.MAGENTA}[+] Starting FTP Scan on {Fore.CYAN}{target_host}:{target_port}{Style.RESET_ALL}")
+
+    # --- Proxy List Setup ---
+    proxies = []
+    proxy_idx = 0
+    orig_socket = socket.socket
+    def set_proxy(proxy_url):
+        import re
+        socks.set_default_proxy(None)
+        socket.socket = orig_socket  # Reset first
+        if not proxy_url:
+            return
+        # If no protocol, default to socks5://
+        if not re.match(r'^(socks5|socks4|http)://', proxy_url.strip(), re.I):
+            proxy_url = f'socks5://{proxy_url.strip()}'
+        m = re.match(r'^(socks5|socks4|http)://([\w\.-]+):(\d+)$', proxy_url.strip(), re.I)
+        if not m:
+            print(f"{Fore.YELLOW}[!] Invalid proxy format: {proxy_url} (skipping proxy){Style.RESET_ALL}")
+            return
+        ptype, host, port = m.group(1).lower(), m.group(2), int(m.group(3))
+        proxy_type_map = {'socks5': socks.SOCKS5, 'socks4': socks.SOCKS4, 'http': socks.HTTP}
+        socks.set_default_proxy(proxy_type_map[ptype], host, port)
+        socket.socket = socks.socksocket
+        print(f"{Fore.CYAN}[*] Using proxy: {proxy_url}{Style.RESET_ALL}")
+
+    # Always filter for working proxies if a proxy list is provided
+    if proxy_list_path and os.path.exists(proxy_list_path):
+        print(f"{Fore.CYAN}[*] Testing proxies and using only working ones for FTP scan...{Style.RESET_ALL}")
+        proxies = load_proxies(proxy_list_path, test=True, max_workers=50)
+        if proxies:
+            print(f"{Fore.CYAN}[*] Loaded {len(proxies)} working proxies for FTP scan.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}[!] No working proxies found in the list. Falling back to direct connection only.{Style.RESET_ALL}")
+            proxies = [None]
+    else:
+        proxies = [None]  # Direct connection only
 
     ftp_connection = None
     is_tls_connection = False
@@ -4711,10 +4763,12 @@ def scan_ftp(target_host, target_port=DEFAULT_FTP_PORT, user_list_path=None, pas
 
     found_creds = False
     for user_cred, passwd_cred in credentials_to_try:
-        cred_ftp_conn = None
-        tried_tls_cred = False
-        while True:
+        proxy_attempts = 0
+        while proxy_attempts < len(proxies):
+            cred_ftp_conn = None
+            tried_tls_cred = False
             try:
+                set_proxy(proxies[proxy_idx])
                 if is_tls_connection or tried_tls_cred:
                     cred_ftp_conn = ftplib.FTP_TLS()
                 else:
@@ -4738,41 +4792,36 @@ def scan_ftp(target_host, target_port=DEFAULT_FTP_PORT, user_list_path=None, pas
                         print(f"{Fore.YELLOW}        Directory listing empty or not permitted.{Style.RESET_ALL}")
                 except ftplib.all_errors as e_ls_cred:
                     print(f"{Fore.YELLOW}        Could not list directory contents: {e_ls_cred}{Style.RESET_ALL}")
-                break  # Success, exit retry loop
+                break  # Success, exit proxy loop
             except ftplib.error_perm:
-                pass
+                break  # Permission error, don't retry with other proxies
             except ftplib.all_errors as e_cred:
                 print(f"{Fore.RED}[-] FTP Error with {user_cred}:{passwd_cred} -> {e_cred}{Style.RESET_ALL}")
                 error_msg_cred = str(e_cred).lower()
-                if (not tried_tls_cred and "421" in str(e_cred) and ("tls" in error_msg_cred or "ssl" in error_msg_cred or "security mechanisms" in error_msg_cred or "must negotiate" in error_msg_cred or "please reconnect using tls" in error_msg_cred)):
-                    print(f"{Fore.YELLOW}[!] Credential login: Server requires TLS. Retrying with FTPS...{Style.RESET_ALL}")
-                    tried_tls_cred = True
-                    if cred_ftp_conn and hasattr(cred_ftp_conn, 'sock') and cred_ftp_conn.sock:
-                        try:
-                            cred_ftp_conn.quit()
-                        except ftplib.all_errors:
-                            pass
-                    continue  # Retry with FTPS
-                if (
-                    isinstance(e_cred, (socket.error, ConnectionRefusedError, ftplib.error_temp))
-                    or "authentication not enabled" in error_msg_cred
-                    or "explicit tls is required" in error_msg_cred
-                    or "session is shutdown" in error_msg_cred
-                ):
-                    print(f"{Fore.RED}[-] Connection/config error ({e_cred}), stopping further credential attempts for this host.{Style.RESET_ALL}")
-                    break
+                if (isinstance(e_cred, (socket.error, ConnectionRefusedError, ftplib.error_temp)) or
+                    "timed out" in error_msg_cred or "connection refused" in error_msg_cred or
+                    "authentication not enabled" in error_msg_cred or "explicit tls is required" in error_msg_cred or "session is shutdown" in error_msg_cred):
+                    print(f"{Fore.YELLOW}[!] Proxy {proxy_idx+1}/{len(proxies)} failed, rotating proxy and retrying...{Style.RESET_ALL}")
+                    proxy_attempts += 1
+                    next_proxy()
+                    continue  # Try next proxy for same credential
+                break  # Other errors, don't retry
             except socket.error as e_sock_cred:
                 print(f"{Fore.RED}[-] Socket error with {user_cred}:{passwd_cred} -> {e_sock_cred}{Style.RESET_ALL}")
-                print(f"{Fore.RED}[-] Connection error, stopping further credential attempts for this host.{Style.RESET_ALL}")
-                break
+                print(f"{Fore.YELLOW}[!] Proxy {proxy_idx+1}/{len(proxies)} failed, rotating proxy and retrying...{Style.RESET_ALL}")
+                proxy_attempts += 1
+                next_proxy()
+                continue
             finally:
                 if cred_ftp_conn and hasattr(cred_ftp_conn, 'sock') and cred_ftp_conn.sock:
                     try:
                         cred_ftp_conn.quit()
                     except ftplib.all_errors:
                         pass
-            break  # Only retry once per credential
-    
+            break  # Only retry once per proxy per credential
+    # Reset socket after scan
+    socks.set_default_proxy(None)
+    socket.socket = orig_socket
     if not found_creds and credentials_to_try: 
         print(f"{Fore.YELLOW}[-] No default credentials worked.{Style.RESET_ALL}")
     elif not credentials_to_try:
@@ -4790,14 +4839,184 @@ if __name__ == "__main__":
             except ValueError:
                 print(f"{Fore.RED}[-] Invalid port specified for FTP: {target_parts[1]}. Using default port {DEFAULT_FTP_PORT}.{Style.RESET_ALL}")
         
-        scan_ftp(ftp_host, ftp_port, args.ftp_userlist, args.ftp_passlist)
+        scan_ftp(ftp_host, ftp_port, args.ftp_userlist, args.ftp_passlist, getattr(args, 'ftp_proxylist', None))
+
+    # Filter proxies if requested
+    if getattr(args, "ftp_proxylist", None) and getattr(args, "filter_proxies", False):
+        working = load_proxies(args.ftp_proxylist, test=True, max_workers=50)
+        out_path = "payloads/working_proxies.txt"
+        with open(out_path, "w") as f:
+            for proxy in working:
+                f.write(f"{proxy}\n")
+        print(f"{Fore.GREEN}Saved {len(working)} working proxies to {out_path}{Style.RESET_ALL}")
+        exit(0)
 
 action_taken = any(vars(args).values()) 
 if not action_taken and not args.update: 
     action_args_present = False
     for arg_name, arg_value in vars(args).items():
         if arg_value and arg_name not in ['save', 'wordlist', 'threads', 'verbose', 'concurrency', 'shodan_api', 'proxy', 'proxy_file', 'heapdump', 'output_dir', 'token', 'save_ranges', 'forbidden_domains', 'ports', 'depth', 'extensions', 'exclude', 'update', 'shodan_api', 'ftp_scan', 'ftp_userlist', 'ftp_passlist']: # Add other non-action args here
-            if getattr(parser_groups_actions.get(arg_name, {}), 'is_action_arg', True): # Hypothetical way to mark action args
-                 action_taken = True
-                 break
-    
+            action_taken = True
+            break
+
+if args.smb_scan:
+    print(f"{Fore.CYAN}[*] Starting SMB Scan on {Fore.CYAN}{args.smb_scan}{Style.RESET_ALL}\n")
+    target = args.smb_scan
+    smb_domain = args.domain or ""
+    smb_user = args.smb_user
+    smb_pass = args.smb_pass
+
+    def smb_scan(target, domain, smb_user, smb_pass):
+        try:
+            smb_conn = SMBConnection(target, target)
+            smb_conn.login(smb_user, smb_pass, domain)
+            print(f"[+] Connected to {target} as {smb_user}")
+            print("[+] Shares:")
+            for share in smb_conn.listShares():
+                print(f"  - {share['shi1_netname'][:-1]}")
+            smb_conn.logoff()
+            print(f"{Fore.GREEN}[+] SMB Scan completed successfully{Style.RESET_ALL}")
+        except SessionError as e:
+            print(f"{Fore.RED}[-] Error: {e}{Style.RESET_ALL}")
+
+    if __name__ == "__main__":
+        smb_scan(target, smb_domain, smb_user, smb_pass)
+
+def smb_auto_pentest(target, spray_userlist=None, spray_passlist=None, spray_password=None, smb_user=None, smb_pass=None, smb_domain=''):
+    from impacket.smbconnection import SMBConnection, SessionError
+    import time
+    print(f"{Fore.CYAN}[SMB Pentest] Target: {target}{Style.RESET_ALL}")
+
+    # 1. Anonymous login
+    print(f"\n{Fore.YELLOW}[1] Testing anonymous login...{Style.RESET_ALL}")
+    try:
+        conn = SMBConnection(target, target)
+        conn.login('', '', '')
+        try:
+            shares = conn.listShares()
+            print(f"{Fore.GREEN}[+] Anonymous login successful!{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Shares:{Style.RESET_ALL}")
+            for share in shares:
+                print(f"  - {share['shi1_netname'][:-1]}")
+        except SessionError as e:
+            print(f"{Fore.YELLOW}[!] Anonymous session established, but share access denied{Style.RESET_ALL}")
+        conn.logoff()
+    except SessionError as e:
+        print(f"{Fore.RED}[-] Anonymous login failed: {e}{Style.RESET_ALL}")
+
+    # 2. Blank credentials (explicit -u "" -p "")
+    print(f"\n{Fore.YELLOW}[2] Testing blank credentials (-u '' -p '')...{Style.RESET_ALL}")
+    try:
+        conn = SMBConnection(target, target)
+        conn.login('', '', '')
+        try:
+            shares = conn.listShares()
+            print(f"{Fore.GREEN}[+] Blank credentials login successful!{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Shares:{Style.RESET_ALL}")
+            for share in shares:
+                print(f"  - {share['shi1_netname'][:-1]}")
+        except SessionError as e:
+            print(f"{Fore.YELLOW}[!] Blank credentials session established, but share access denied{Style.RESET_ALL}")
+        conn.logoff()
+    except SessionError as e:
+        print(f"{Fore.RED}[-] Blank credentials login failed: {e}{Style.RESET_ALL}")
+
+    # 3. RID Brute Force for users (RID 500-550)
+    print(f"\n{Fore.YELLOW}[3] RID Brute Force (500-550)...{Style.RESET_ALL}")
+    try:
+        from impacket.dcerpc.v5 import transport, samr
+        rpctransport = transport.SMBTransport(target, 445, r'\samr', '', '', '', '', '')
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()
+        dce.bind(samr.MSRPC_UUID_SAMR)
+        resp = samr.hSamrConnect(dce)
+        serverHandle = resp['ServerHandle']
+        domains = samr.hSamrEnumerateDomainsInSamServer(dce, serverHandle)['Buffer']['Buffer']
+        users_found = False
+        for dom in domains:
+            dom_name = dom['Name']
+            dom_sid = samr.hSamrLookupDomainInSamServer(dce, serverHandle, dom_name)['DomainId']
+            dom_handle = samr.hSamrOpenDomain(dce, serverHandle, samr.MAXIMUM_ALLOWED, dom_sid)['DomainHandle']
+            for rid in range(500, 551):
+                try:
+                    user = samr.hSamrLookupIdsInDomain(dce, dom_handle, [rid])
+                    print(f"  RID {rid}: {user['Names']['Names'][0]['Name']}")
+                    users_found = True
+                except Exception:
+                    continue
+        if not users_found:
+            print(f"{Fore.YELLOW}[!] No users found in RID range 500-550{Style.RESET_ALL}")
+        dce.disconnect()
+    except Exception as e:
+        print(f"{Fore.RED}[-] RID brute force failed: {e}{Style.RESET_ALL}")
+
+    # 4. Test specific credentials (if provided)
+    if smb_user and smb_pass:
+        print(f"\n{Fore.YELLOW}[4] Testing specific credentials ({smb_user})...{Style.RESET_ALL}")
+        try:
+            conn = SMBConnection(target, target)
+            conn.login(smb_user, smb_pass, smb_domain)
+            try:
+                shares = conn.listShares()
+                print(f"{Fore.GREEN}[+] Login successful: {smb_user}:{smb_pass}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Accessible Shares:{Style.RESET_ALL}")
+                for share in shares:
+                    share_name = share['shi1_netname'][:-1]
+                    print(f"  - {share_name}")
+                    # Test if we can list files in the share
+                    try:
+                        files = conn.listPath(share_name, '*')
+                        print(f"    {Fore.GREEN}✓ Can list files ({len(files)} items){Style.RESET_ALL}")
+                    except:
+                        print(f"    {Fore.YELLOW}! Cannot list files (access denied){Style.RESET_ALL}")
+            except SessionError as e:
+                print(f"{Fore.YELLOW}[!] Login successful but share access denied: {e}{Style.RESET_ALL}")
+            conn.logoff()
+        except SessionError as e:
+            print(f"{Fore.RED}[-] Login failed: {e}{Style.RESET_ALL}")
+
+    # 5. Password Spray (if user list and password/passlist provided)
+    if spray_userlist and (spray_passlist or spray_password):
+        print(f"\n{Fore.YELLOW}[5] Password Spraying...{Style.RESET_ALL}")
+        try:
+            with open(spray_userlist, 'r') as uf:
+                users = [u.strip() for u in uf if u.strip()]
+            
+            # Use password file if provided, otherwise use single password
+            if spray_passlist:
+                with open(spray_passlist, 'r') as pf:
+                    passwords = [p.strip() for p in pf if p.strip()]
+                print(f"{Fore.CYAN}[*] Using password list: {spray_passlist}{Style.RESET_ALL}")
+            elif spray_password:
+                passwords = [spray_password]
+                print(f"{Fore.CYAN}[*] Using single password: {spray_password}{Style.RESET_ALL}")
+            
+            for password in passwords:
+                print(f"\n{Fore.CYAN}[*] Trying password: {password}{Style.RESET_ALL}")
+                for user in users:
+                    try:
+                        conn = SMBConnection(target, target)
+                        conn.login(user, password, '')
+                        print(f"{Fore.GREEN}[+] Success: {user}:{password}{Style.RESET_ALL}")
+                        conn.logoff()
+                    except SessionError as e:
+                        if 'STATUS_LOGON_FAILURE' not in str(e):
+                            print(f"{Fore.YELLOW}[!] {user}:{password} - {e}{Style.RESET_ALL}")
+                        # else: fail silently for logon failure
+                    time.sleep(0.1)  # avoid lockout
+        except Exception as e:
+            print(f"{Fore.RED}[-] Password spraying failed: {e}{Style.RESET_ALL}")
+    else:
+        step_num = "5" if smb_user and smb_pass else "4"
+        print(f"\n{Fore.YELLOW}[{step_num}] Password Spraying skipped (no user list or password provided){Style.RESET_ALL}")
+
+if args.smb_auto:
+    smb_auto_pentest(
+        args.smb_target or args.smb_scan,
+        spray_userlist=args.spray_userlist,
+        spray_passlist=args.spray_passlist,
+        spray_password=args.spray_password,
+        smb_user=getattr(args, 'smb_user', None),
+        smb_pass=getattr(args, 'smb_pass', None),
+        smb_domain=getattr(args, 'smb_domain', '')
+    )
